@@ -9,15 +9,15 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
 )
 
 type Client struct {
-	OfficialURL           *url.URL
-	TrendingRepositoryURL *url.URL
-	HTTPClient            *http.Client
+	OfficialURL *url.URL
+	HTTPClient  *http.Client
 }
 
 type Item struct {
@@ -56,11 +56,14 @@ type Result struct {
 func (item *Item) GetRepositoryName() string {
 	name := item.FullName
 	if name == "" {
-		url, err := url.Parse(item.URL)
-		if err != nil {
-			return ""
+		if item.URL == "" {
+			return item.Name
 		}
-		name = url.Path[1:]
+		u, err := url.Parse(item.URL)
+		if err != nil {
+			return item.Name
+		}
+		name = u.Path[1:]
 	}
 	return name
 }
@@ -74,11 +77,11 @@ func (item *Item) GetStars() int {
 }
 
 func (item *Item) GetRepositoryURL() string {
-	url := item.HTMLURL
-	if url == "" {
+	u := item.HTMLURL
+	if u == "" {
 		return item.URL
 	}
-	return url
+	return u
 }
 func (item *Item) GetDescription() string {
 	description := item.Description
@@ -95,11 +98,14 @@ func (item *Item) GetLanguage() string {
 	return language
 }
 func (item *Item) GetCloneURL() string {
-	url := item.GetRepositoryURL()
-	if !strings.HasSuffix(url, ".git") {
-		return url + ".git"
+	u := item.GetRepositoryURL()
+	if u == "" {
+		return ""
 	}
-	return url
+	if !strings.HasSuffix(u, ".git") {
+		return u + ".git"
+	}
+	return u
 }
 
 func (item *Item) String() string {
@@ -127,18 +133,22 @@ func (item *Item) String() string {
 	if item.DataSource == "OfficialAPI" {
 		templateText = officialTemplateText
 	}
-	template, err := template.New("Repository").Parse(templateText)
+	tmpl, err := template.New("Repository").Parse(templateText)
 	if err != nil {
-		panic(err)
+		return fmt.Sprintf("Name: %s", item.GetRepositoryName())
 	}
 	var doc bytes.Buffer
-	if err := template.Execute(&doc, item); err != nil {
-		panic(err)
+	if err := tmpl.Execute(&doc, item); err != nil {
+		return fmt.Sprintf("Name: %s", item.GetRepositoryName())
 	}
 	return doc.String()
 }
 
 func (result *Result) Draw(writer io.Writer) error {
+	if result == nil || len(result.Items) == 0 {
+		fmt.Fprintln(writer, "  No repositories found.")
+		return nil
+	}
 	for _, item := range result.Items {
 		starText := " ⭐️ " + strconv.Itoa(item.GetStars())
 		fmt.Fprintf(writer, "%-10.10s\033[32m%s\033[0m\n", starText, item.GetRepositoryName())
@@ -151,56 +161,53 @@ func NewClient() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	trendingRepositoryURL, err := url.Parse("https://trendings.herokuapp.com/repo")
-	if err != nil {
-		return nil, err
-	}
 	return &Client{
-		OfficialURL:           officialURL,
-		TrendingRepositoryURL: trendingRepositoryURL,
-		HTTPClient:            http.DefaultClient,
+		OfficialURL: officialURL,
+		HTTPClient:  http.DefaultClient,
 	}, nil
 }
 
 func (client *Client) SearchRepository(query string) (*Result, error) {
-	url := *client.OfficialURL
-	url.Path = path.Join(url.Path, "search", "repositories")
-	req, err := http.NewRequest("GET", url.String()+"?q="+query, nil)
+	u := *client.OfficialURL
+	u.Path = path.Join(u.Path, "search", "repositories")
+	req, err := http.NewRequest("GET", u.String()+"?q="+query, nil)
 	if err != nil {
-		panic(err)
+		return &Result{Items: []Item{}}, err
 	}
 	req.Header.Add("Accept", "application/vnd.github.mercy-preview+json")
 	resp, err := client.HTTPClient.Do(req)
 	if err != nil {
-		panic(err)
+		return &Result{Items: []Item{}}, err
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return &Result{Items: []Item{}}, err
 	}
 	var result *Result
 	if err = json.Unmarshal(body, &result); err != nil {
-		return nil, err
+		return &Result{Items: []Item{}}, err
 	}
-	items := result.Items
-	for i := range items {
+	if result == nil {
+		return &Result{Items: []Item{}}, nil
+	}
+	for i := range result.Items {
 		result.Items[i].DataSource = "OfficialAPI"
 	}
 	return result, nil
 }
 
 func (client *Client) GetReadme(item Item) (*Readme, error) {
-	url := *client.OfficialURL
-	url.Path = path.Join(url.Path, "repos", item.GetRepositoryName(), "readme")
-	req, err := http.NewRequest("GET", url.String(), nil)
+	u := *client.OfficialURL
+	u.Path = path.Join(u.Path, "repos", item.GetRepositoryName(), "readme")
+	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	req.Header.Add("Accept", "application/vnd.github.mercy-preview+json")
 	resp, err := client.HTTPClient.Do(req)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
@@ -213,38 +220,133 @@ func (client *Client) GetReadme(item Item) (*Readme, error) {
 	}
 	return readme, nil
 }
+
+// GetTrendingRepository scrapes GitHub's trending page directly
+// since all third-party trending APIs (trendings.herokuapp.com, ghapi.huchen.dev) are dead.
 func (client *Client) GetTrendingRepository(language string, since string) (*Result, error) {
-	q := client.TrendingRepositoryURL.Query()
+	// Build the GitHub trending URL
+	trendingURL := "https://github.com/trending"
 	if language != "" {
-		q.Set("lang", language)
+		trendingURL += "/" + language
 	}
+	params := url.Values{}
 	if since != "" {
-		q.Set("since", since)
+		params.Set("since", since)
 	}
-	url := client.TrendingRepositoryURL
-	if len(q) != 0 {
-		url.RawQuery = q.Encode()
+	if len(params) > 0 {
+		trendingURL += "?" + params.Encode()
 	}
-	req, err := http.NewRequest("GET", url.String(), nil)
+
+	req, err := http.NewRequest("GET", trendingURL, nil)
 	if err != nil {
-		return nil, err
+		return &Result{Items: []Item{}}, err
 	}
-	req.Header.Add("Accept", "application/vnd.github.mercy-preview+json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) lazyhub/1.0")
+	req.Header.Set("Accept", "text/html")
+
 	resp, err := client.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return &Result{Items: []Item{}}, err
 	}
 	defer resp.Body.Close()
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return &Result{Items: []Item{}}, err
 	}
-	var result *Result
-	if err = json.Unmarshal(body, &result); err != nil {
-		return nil, err
+
+	html := string(body)
+	items := parseTrendingHTML(html)
+
+	if len(items) == 0 {
+		return &Result{Items: []Item{}}, nil
 	}
-	for i := range result.Items {
-		result.Items[i].DataSource = "TrendingAPI"
+
+	return &Result{Items: items}, nil
+}
+
+// parseTrendingHTML extracts repository data from the GitHub trending page HTML.
+// It uses regex to parse the article.Box-row elements.
+func parseTrendingHTML(html string) []Item {
+	var items []Item
+
+	// Match each repo article block
+	reArticle := regexp.MustCompile(`(?s)<article class="Box-row">(.+?)</article>`)
+	articles := reArticle.FindAllStringSubmatch(html, -1)
+
+	// Repo name pattern: <h2 ...> <a href="/owner/repo" ...>
+	reRepo := regexp.MustCompile(`<h2[^>]*>[\s\S]*?<a[^>]*href="(/[^"]+)"`)
+	// Description
+	reDesc := regexp.MustCompile(`<p class="col-9[^"]*"[^>]*>([\s\S]*?)</p>`)
+	// Language
+	reLang := regexp.MustCompile(`<span itemprop="programmingLanguage">(.*?)</span>`)
+	// Stars count — the number appears on a separate line inside the stargazers <a> tag, after an SVG
+	reStars := regexp.MustCompile(`(?s)<a[^>]*href="/[^/]+/[^/]+/stargazers"[^>]*>.*?>\s*([\d,]+)\s*</a>`)
+	// Today's stars
+	reTodayStars := regexp.MustCompile(`([\d,]+)\s*stars\s*(today|this week|this month)`)
+
+	for _, match := range articles {
+		block := match[1]
+
+		// Extract repo path
+		repoMatch := reRepo.FindStringSubmatch(block)
+		if repoMatch == nil {
+			continue
+		}
+		repoPath := strings.TrimSpace(repoMatch[1])
+		repoPath = strings.TrimPrefix(repoPath, "/")
+
+		// Extract description
+		desc := ""
+		descMatch := reDesc.FindStringSubmatch(block)
+		if descMatch != nil {
+			desc = strings.TrimSpace(descMatch[1])
+			// Strip HTML tags from description
+			reTag := regexp.MustCompile(`<[^>]*>`)
+			desc = reTag.ReplaceAllString(desc, "")
+			desc = strings.TrimSpace(desc)
+		}
+
+		// Extract language
+		lang := ""
+		langMatch := reLang.FindStringSubmatch(block)
+		if langMatch != nil {
+			lang = strings.TrimSpace(langMatch[1])
+		}
+
+		// Extract stars
+		stars := "0"
+		starsMatch := reStars.FindStringSubmatch(block)
+		if starsMatch != nil {
+			stars = strings.TrimSpace(starsMatch[1])
+		}
+
+		// Extract today's stars (for display purposes)
+		todayStars := ""
+		todayMatch := reTodayStars.FindStringSubmatch(block)
+		if todayMatch != nil {
+			todayStars = todayMatch[1] + " stars " + todayMatch[2]
+		}
+		_ = todayStars
+
+		parts := strings.SplitN(repoPath, "/", 2)
+		name := repoPath
+		if len(parts) == 2 {
+			name = parts[1]
+		}
+
+		item := Item{
+			Name:       name,
+			FullName:   repoPath,
+			URL:        "https://github.com/" + repoPath,
+			Stars:      stars,
+			Language:   lang,
+			Lang:       lang,
+			Desc:       desc,
+			DataSource: "TrendingAPI",
+		}
+		items = append(items, item)
 	}
-	return result, nil
+
+	return items
 }

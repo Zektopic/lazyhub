@@ -20,11 +20,6 @@ var searchPanel *ui.SearchPanel
 var loadingPanel *ui.LoadingPanel
 var cursor *ui.Cursor
 
-func _main() {
-	client, _ = lib.NewClient()
-	_, _ = client.GetTrendingRepository("", "")
-}
-
 func main() {
 	g, err := gocui.NewGui(gocui.OutputNormal)
 	if err != nil {
@@ -41,13 +36,21 @@ func main() {
 	loadingPanel, _ = ui.NewLoadingPanel()
 	cursor = &ui.Cursor{}
 
-	result, _ := client.GetTrendingRepository("", "")
+	result, err := client.GetTrendingRepository("", "")
+	if err != nil || result == nil || len(result.Items) == 0 {
+		// Provide a fallback empty result so the UI doesn't crash
+		result = &lib.Result{Items: []lib.Item{}}
+	}
 	repositoryPanel.Result = result
 
 	repositoryPanel.DrawView(g)
 	textPanel.DrawView(g)
 	statusPanel.DrawView(g)
-	textPanel.DrawText(g, &repositoryPanel.Result.Items[0])
+
+	// Only draw text if we have items
+	if len(repositoryPanel.Result.Items) > 0 {
+		textPanel.DrawText(g, &repositoryPanel.Result.Items[0])
+	}
 	g.SetCurrentView(repositoryPanel.ViewName)
 
 	if err := g.SetKeybinding("", gocui.KeyCtrlC, gocui.ModNone, quit); err != nil {
@@ -113,7 +116,6 @@ func main() {
 	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
 		log.Panicln(err)
 	}
-
 }
 
 func layout(g *gocui.Gui) error {
@@ -128,12 +130,16 @@ func render(g *gocui.Gui) {
 
 func cursorMovement(d int) func(g *gocui.Gui, v *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
+		if repositoryPanel.Result == nil || len(repositoryPanel.Result.Items) == 0 {
+			return nil
+		}
 		cursor.Move(g, v, d, func(yOffset int, yCurrent int) error {
 			if g.CurrentView().Name() == repositoryPanel.ViewName {
-				if yOffset+yCurrent >= len(repositoryPanel.Result.Items) {
+				idx := yOffset + yCurrent
+				if idx >= len(repositoryPanel.Result.Items) {
 					return nil
 				}
-				textPanel.DrawText(g, &repositoryPanel.Result.Items[yOffset+yCurrent])
+				textPanel.DrawText(g, &repositoryPanel.Result.Items[idx])
 			}
 			return nil
 		})
@@ -142,8 +148,16 @@ func cursorMovement(d int) func(g *gocui.Gui, v *gocui.View) error {
 }
 
 func copyCloneCommand(g *gocui.Gui, _ *gocui.View) error {
+	if repositoryPanel.Result == nil || len(repositoryPanel.Result.Items) == 0 {
+		statusPanel.DrawText(g, "No repositories loaded.")
+		return nil
+	}
 	yOffset, yCurrent, _ := cursor.FindPosition(g, repositoryPanel.ViewName)
-	currentItem := repositoryPanel.Result.Items[yCurrent+yOffset]
+	idx := yCurrent + yOffset
+	if idx >= len(repositoryPanel.Result.Items) {
+		return nil
+	}
+	currentItem := repositoryPanel.Result.Items[idx]
 
 	err := clipboard.WriteAll("git clone " + currentItem.GetCloneURL())
 	if err != nil {
@@ -156,29 +170,37 @@ func copyCloneCommand(g *gocui.Gui, _ *gocui.View) error {
 }
 
 func openBrowser(g *gocui.Gui, _ *gocui.View) error {
+	if repositoryPanel.Result == nil || len(repositoryPanel.Result.Items) == 0 {
+		statusPanel.DrawText(g, "No repositories loaded.")
+		return nil
+	}
 	yOffset, yCurrent, _ := cursor.FindPosition(g, repositoryPanel.ViewName)
-	currentItem := repositoryPanel.Result.Items[yCurrent+yOffset]
+	idx := yCurrent + yOffset
+	if idx >= len(repositoryPanel.Result.Items) {
+		return nil
+	}
+	currentItem := repositoryPanel.Result.Items[idx]
 	url := currentItem.GetRepositoryURL()
 
-	var err error
+	var openErr error
 
 	switch runtime.GOOS {
 	case "linux":
-		err = exec.Command("xdg-open", url).Start()
+		openErr = exec.Command("xdg-open", url).Start()
 	case "windows":
-		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+		openErr = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	case "darwin":
-		err = exec.Command("open", url).Start()
+		openErr = exec.Command("open", url).Start()
 	default:
 		statusPanel.DrawText(g, "Failed to open URL. Unsupported platform.")
 	}
-	if err != nil {
+	if openErr != nil {
 		statusPanel.DrawText(g, "Failed to open URL.")
 	}
 	statusPanel.DrawText(g, "Success to open URL. "+url)
 	return nil
-
 }
+
 func drawSearchEditor(g *gocui.Gui, _ *gocui.View) error {
 	err := searchPanel.DrawView(g)
 	if err != nil {
@@ -188,8 +210,16 @@ func drawSearchEditor(g *gocui.Gui, _ *gocui.View) error {
 }
 
 func drawReadme(g *gocui.Gui, _ *gocui.View) error {
+	if repositoryPanel.Result == nil || len(repositoryPanel.Result.Items) == 0 {
+		statusPanel.DrawText(g, "No repositories loaded.")
+		return nil
+	}
 	yOffset, yCurrent, _ := cursor.FindPosition(g, repositoryPanel.ViewName)
-	currentItem := repositoryPanel.Result.Items[yCurrent+yOffset]
+	idx := yCurrent + yOffset
+	if idx >= len(repositoryPanel.Result.Items) {
+		return nil
+	}
+	currentItem := repositoryPanel.Result.Items[idx]
 	loadingPanel.ShowLoading(g, func() {
 		readme, err := client.GetReadme(currentItem)
 		if err != nil {
@@ -216,17 +246,18 @@ func searchRepositoryByTopic(g *gocui.Gui, v *gocui.View) error {
 	}
 	g.DeleteView(searchPanel.ViewName)
 	loadingPanel.ShowLoading(g, func() {
-		repositoryPanel.Result, err = client.SearchRepository(topic)
-		if err != nil {
+		result, searchErr := client.SearchRepository(topic)
+		if searchErr != nil || result == nil {
 			statusPanel.DrawText(g, "Failed to search repositories.")
-		} else {
-			vr.Clear()
-			vr.Title = " Search [" + topic + "]"
-			repositoryPanel.Result.Draw(vr)
-			g.SetCurrentView(repositoryPanel.ViewName)
-			if len(repositoryPanel.Result.Items) != 0 {
-				textPanel.DrawText(g, &repositoryPanel.Result.Items[0])
-			}
+			result = &lib.Result{Items: []lib.Item{}}
+		}
+		repositoryPanel.Result = result
+		vr.Clear()
+		vr.Title = " Search [" + topic + "]"
+		repositoryPanel.Result.Draw(vr)
+		g.SetCurrentView(repositoryPanel.ViewName)
+		if len(repositoryPanel.Result.Items) != 0 {
+			textPanel.DrawText(g, &repositoryPanel.Result.Items[0])
 		}
 	})
 	cursor.MoveToFirst(g, vr)
