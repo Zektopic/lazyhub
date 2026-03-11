@@ -71,7 +71,7 @@ Search repositories
 
 # Using API
 
-* https://github.com/huchenme/github-trending-api
+* https://github-trending-api-ten.vercel.app
 
 # LICENSE
 
