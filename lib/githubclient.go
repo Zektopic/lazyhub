@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -51,6 +50,15 @@ type Readme struct {
 
 type Result struct {
 	Items []Item `json:"items"`
+}
+
+type TrendingItem struct {
+	Author      string `json:"author"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	Description string `json:"description"`
+	Language    string `json:"language"`
+	Stars       int    `json:"stars"`
 }
 
 func (item *Item) GetRepositoryName() string {
@@ -221,15 +229,14 @@ func (client *Client) GetReadme(item Item) (*Readme, error) {
 	return readme, nil
 }
 
-// GetTrendingRepository scrapes GitHub's trending page directly
+// GetTrendingRepository scrapes from github-trending-api-ten.vercel.app directly
 // since all third-party trending APIs (trendings.herokuapp.com, ghapi.huchen.dev) are dead.
 func (client *Client) GetTrendingRepository(language string, since string) (*Result, error) {
-	// Build the GitHub trending URL
-	trendingURL := "https://github.com/trending"
-	if language != "" {
-		trendingURL += "/" + language
-	}
+	trendingURL := "https://github-trending-api-ten.vercel.app/repositories"
 	params := url.Values{}
+	if language != "" {
+		params.Set("language", language)
+	}
 	if since != "" {
 		params.Set("since", since)
 	}
@@ -242,7 +249,7 @@ func (client *Client) GetTrendingRepository(language string, since string) (*Res
 		return &Result{Items: []Item{}}, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) lazyhub/1.0")
-	req.Header.Set("Accept", "text/html")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.HTTPClient.Do(req)
 	if err != nil {
@@ -255,98 +262,29 @@ func (client *Client) GetTrendingRepository(language string, since string) (*Res
 		return &Result{Items: []Item{}}, err
 	}
 
-	html := string(body)
-	items := parseTrendingHTML(html)
+	var trendingItems []TrendingItem
+	if err = json.Unmarshal(body, &trendingItems); err != nil {
+		return &Result{Items: []Item{}}, err
+	}
 
-	if len(items) == 0 {
+	if len(trendingItems) == 0 {
 		return &Result{Items: []Item{}}, nil
 	}
 
-	return &Result{Items: items}, nil
-}
-
-// parseTrendingHTML extracts repository data from the GitHub trending page HTML.
-// It uses regex to parse the article.Box-row elements.
-func parseTrendingHTML(html string) []Item {
 	var items []Item
-
-	// Match each repo article block
-	reArticle := regexp.MustCompile(`(?s)<article class="Box-row">(.+?)</article>`)
-	articles := reArticle.FindAllStringSubmatch(html, -1)
-
-	// Repo name pattern: <h2 ...> <a href="/owner/repo" ...>
-	reRepo := regexp.MustCompile(`<h2[^>]*>[\s\S]*?<a[^>]*href="(/[^"]+)"`)
-	// Description
-	reDesc := regexp.MustCompile(`<p class="col-9[^"]*"[^>]*>([\s\S]*?)</p>`)
-	// Language
-	reLang := regexp.MustCompile(`<span itemprop="programmingLanguage">(.*?)</span>`)
-	// Stars count — the number appears on a separate line inside the stargazers <a> tag, after an SVG
-	reStars := regexp.MustCompile(`(?s)<a[^>]*href="/[^/]+/[^/]+/stargazers"[^>]*>.*?>\s*([\d,]+)\s*</a>`)
-	// Today's stars
-	reTodayStars := regexp.MustCompile(`([\d,]+)\s*stars\s*(today|this week|this month)`)
-
-	for _, match := range articles {
-		block := match[1]
-
-		// Extract repo path
-		repoMatch := reRepo.FindStringSubmatch(block)
-		if repoMatch == nil {
-			continue
-		}
-		repoPath := strings.TrimSpace(repoMatch[1])
-		repoPath = strings.TrimPrefix(repoPath, "/")
-
-		// Extract description
-		desc := ""
-		descMatch := reDesc.FindStringSubmatch(block)
-		if descMatch != nil {
-			desc = strings.TrimSpace(descMatch[1])
-			// Strip HTML tags from description
-			reTag := regexp.MustCompile(`<[^>]*>`)
-			desc = reTag.ReplaceAllString(desc, "")
-			desc = strings.TrimSpace(desc)
-		}
-
-		// Extract language
-		lang := ""
-		langMatch := reLang.FindStringSubmatch(block)
-		if langMatch != nil {
-			lang = strings.TrimSpace(langMatch[1])
-		}
-
-		// Extract stars
-		stars := "0"
-		starsMatch := reStars.FindStringSubmatch(block)
-		if starsMatch != nil {
-			stars = strings.TrimSpace(starsMatch[1])
-		}
-
-		// Extract today's stars (for display purposes)
-		todayStars := ""
-		todayMatch := reTodayStars.FindStringSubmatch(block)
-		if todayMatch != nil {
-			todayStars = todayMatch[1] + " stars " + todayMatch[2]
-		}
-		_ = todayStars
-
-		parts := strings.SplitN(repoPath, "/", 2)
-		name := repoPath
-		if len(parts) == 2 {
-			name = parts[1]
-		}
-
-		item := Item{
-			Name:       name,
-			FullName:   repoPath,
-			URL:        "https://github.com/" + repoPath,
-			Stars:      stars,
-			Language:   lang,
-			Lang:       lang,
-			Desc:       desc,
+	for _, ti := range trendingItems {
+		fullName := ti.Author + "/" + ti.Name
+		items = append(items, Item{
+			Name:       ti.Name,
+			FullName:   fullName,
+			URL:        ti.URL,
+			Stars:      strconv.Itoa(ti.Stars),
+			Language:   ti.Language,
+			Lang:       ti.Language,
+			Desc:       ti.Description,
 			DataSource: "TrendingAPI",
-		}
-		items = append(items, item)
+		})
 	}
 
-	return items
+	return &Result{Items: items}, nil
 }
